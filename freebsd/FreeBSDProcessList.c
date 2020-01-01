@@ -36,6 +36,7 @@ typedef struct CPUData_ {
    double nicePercent;
    double systemPercent;
    double irqPercent;
+   double guestPercent;
    double idlePercent;
    double systemAllPercent;
 
@@ -62,6 +63,14 @@ typedef struct FreeBSDProcessList_ {
    unsigned long  *cp_times_o;
    unsigned long  *cp_times_n;
 
+   unsigned long long *guest_tick_o;
+   unsigned long long *guest_tick_n;
+
+   unsigned long long *guest_ticks_o;
+   unsigned long long *guest_ticks_n;
+
+   unsigned long int nominal_hz;
+
 } FreeBSDProcessList;
 
 }*/
@@ -85,6 +94,8 @@ static int MIB_kstat_zfs_misc_arcstats_size[5];
 static int MIB_kern_cp_time[2];
 static int MIB_kern_cp_times[2];
 static int kernelFScale;
+
+static double guest_ticks_to_time;
 
 ProcessList* ProcessList_new(UsersTable* usersTable, Hashtable* pidWhiteList, uid_t userId) {
    size_t len;
@@ -172,7 +183,6 @@ ProcessList* ProcessList_new(UsersTable* usersTable, Hashtable* pidWhiteList, ui
      fpl->cpus = xRealloc(fpl->cpus, (pl->cpuCount + 1) * sizeof(CPUData));
    }
 
-
    len = sizeof(kernelFScale);
    if (sysctlbyname("kern.fscale", &kernelFScale, &len, NULL, 0) == -1) {
       //sane default for kernel provided CPU percentage scaling, at least on x86 machines, in case this sysctl call failed
@@ -183,6 +193,20 @@ ProcessList* ProcessList_new(UsersTable* usersTable, Hashtable* pidWhiteList, ui
    if (fpl->kd == NULL) {
       errx(1, "kvm_open: %s", errbuf);
    }
+
+   // Running average of per-cpu guest time
+   fpl->guest_tick_o = xCalloc(1, sizeof(unsigned long long));
+   fpl->guest_tick_n = xCalloc(1, sizeof(unsigned long long));
+
+   // Per-cpu guest time counters.
+   fpl->guest_ticks_o = xCalloc(cpus, sizeof(unsigned long long));
+   fpl->guest_ticks_n = xCalloc(cpus, sizeof(unsigned long long));
+
+   int nominal_hz;
+   len = sizeof(nominal_hz);
+   sysctlbyname("kern.hz", &nominal_hz, &len, NULL, 0);
+   /* From sys/kern/subr_param.c. Note, only an estimate. */
+   guest_ticks_to_time = nominal_hz * 1. / (1ULL << 32);
 
    return pl;
 }
@@ -195,6 +219,10 @@ void ProcessList_delete(ProcessList* this) {
    free(fpl->cp_time_n);
    free(fpl->cp_times_o);
    free(fpl->cp_times_n);
+   free(fpl->guest_tick_o);
+   free(fpl->guest_tick_o);
+   free(fpl->guest_ticks_n);
+   free(fpl->guest_ticks_n);
    free(fpl->cpus);
 
    ProcessList_done(this);
@@ -212,11 +240,16 @@ static inline void FreeBSDProcessList_scanCPUTime(ProcessList* pl) {
 
    size_t sizeof_cp_time_array;
 
-   unsigned long     *cp_time_n; // old clicks state
-   unsigned long     *cp_time_o; // current clicks state
+   unsigned long     *cp_time_n;  // new ticks state
+   unsigned long     *cp_time_o;  // old ticks state
 
    unsigned long cp_time_d[CPUSTATES];
    double        cp_time_p[CPUSTATES];
+
+   size_t sizeof_guest_ticks_array;
+
+   unsigned long long *guest_tick_n;  // new guest ticks
+   unsigned long long *guest_tick_o;  // old guest ticks
 
    // get averages or single CPU clicks
    sizeof_cp_time_array = sizeof(unsigned long) * CPUSTATES;
@@ -232,21 +265,39 @@ static inline void FreeBSDProcessList_scanCPUTime(ProcessList* pl) {
        sysctl(MIB_kern_cp_times, 2, fpl->cp_times_n, &sizeof_cp_time_array, NULL, 0);
    }
 
+   // The vmm kernel module can be dynamically loaded and unloaded, so we look up
+   // the sysctl each time by name.
+   sizeof_guest_ticks_array = sizeof(unsigned long) * cpus;
+   sysctlbyname("hw.vmm.stat.guest_ticks", fpl->guest_ticks_n, &sizeof_guest_ticks_array, NULL, 0);
+
+   // Compute per-cpu guest running average.
+   unsigned long long total_guest_ticks = 0;
+   for (int i = 0; i < cpus; i++) {
+      total_guest_ticks += fpl->guest_ticks_n[i];
+   }
+   *(fpl->guest_tick_n) = (unsigned long long) (total_guest_ticks * 1. / cpus);
+
    for (int i = 0; i < maxcpu; i++) {
       if (cpus == 1) {
          // single CPU box
          cp_time_n = fpl->cp_time_n;
          cp_time_o = fpl->cp_time_o;
+         guest_tick_n = fpl->guest_tick_n;
+         guest_tick_o = fpl->guest_tick_o;
       } else {
          if (i == 0 ) {
            // average
            cp_time_n = fpl->cp_time_n;
            cp_time_o = fpl->cp_time_o;
+           guest_tick_n = fpl->guest_tick_n;
+           guest_tick_o = fpl->guest_tick_o;
          } else {
            // specific smp cores
            cp_times_offset = i - 1;
            cp_time_n = fpl->cp_times_n + (cp_times_offset * CPUSTATES);
            cp_time_o = fpl->cp_times_o + (cp_times_offset * CPUSTATES);
+           guest_tick_n = fpl->guest_ticks_n + cp_times_offset;
+           guest_tick_o = fpl->guest_ticks_o + cp_times_offset;
          }
       }
 
@@ -270,10 +321,23 @@ static inline void FreeBSDProcessList_scanCPUTime(ProcessList* pl) {
         cp_time_p[s] = ((double)cp_time_d[s]) / ((double)total_d) * 100;
       }
 
+      // guest time.
+      if (*guest_tick_o > *guest_tick_n) {
+         // maybe vmm.ko was unloaded and reloaded?
+         *guest_tick_o = *guest_tick_n;
+      }
+      unsigned long long guest_tick_d = *guest_tick_n - *guest_tick_o;
+      double guest_time_d = guest_tick_d * guest_ticks_to_time;
+      double guest_p = ((double)guest_time_d / ((double)total_d)) * 100.;
+      guest_p = MIN(guest_p, cp_time_p[CP_SYS]);
+      *guest_tick_o = *guest_tick_n;
+
       CPUData* cpuData = &(fpl->cpus[i]);
       cpuData->userPercent      = cp_time_p[CP_USER];
       cpuData->nicePercent      = cp_time_p[CP_NICE];
-      cpuData->systemPercent    = cp_time_p[CP_SYS];
+      // guest time is already accounted as kernel time.
+      cpuData->systemPercent    = cp_time_p[CP_SYS] - guest_p;
+      cpuData->guestPercent     = guest_p;
       cpuData->irqPercent       = cp_time_p[CP_INTR];
       cpuData->systemAllPercent = cp_time_p[CP_SYS] + cp_time_p[CP_INTR];
       // this one is not really used, but we store it anyway
