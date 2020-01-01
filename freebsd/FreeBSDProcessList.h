@@ -25,6 +25,7 @@ typedef struct CPUData_ {
    double nicePercent;
    double systemPercent;
    double irqPercent;
+   double guestPercent;
    double idlePercent;
    double systemAllPercent;
 
@@ -50,6 +51,12 @@ typedef struct FreeBSDProcessList_ {
 
    unsigned long  *cp_times_o;
    unsigned long  *cp_times_n;
+
+   unsigned long long *guest_tick_o;
+   unsigned long long *guest_tick_n;
+
+   unsigned long long *guest_ticks_o;
+   unsigned long long *guest_ticks_n;
 
 } FreeBSDProcessList;
 

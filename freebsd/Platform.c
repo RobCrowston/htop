@@ -168,8 +168,9 @@ double Platform_setCPUValues(Meter* this, int cpu) {
    if (this->pl->settings->detailedCPUTime) {
       v[CPU_METER_KERNEL]  = cpuData->systemPercent;
       v[CPU_METER_IRQ]     = cpuData->irqPercent;
-      Meter_setItems(this, 4);
-      percent = v[0]+v[1]+v[2]+v[3];
+      v[CPU_METER_GUEST]   = cpuData->guestPercent;
+      Meter_setItems(this, 7);
+      percent = v[0]+v[1]+v[2]+v[3]+v[CPU_METER_GUEST];
    } else {
       v[2] = cpuData->systemAllPercent;
       Meter_setItems(this, 3);
